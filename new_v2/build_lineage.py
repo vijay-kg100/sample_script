@@ -1,3 +1,4 @@
+import os
 import sys
 import re
 import json
@@ -240,27 +241,32 @@ def write_html_report(df_lineage, df_catalog, out_path, title="Lineage Report"):
 
 def session_read_write_sets(folder_idx, mapping_name):
     """For a mapping, return:
-       writes: set of (target_table, target_field)
-       reads:  set of (source_table, source_field)
+       writes: {(target_table, target_field): set(instance_names)}
+       reads:  {(source_table, source_field): set(instance_names)}
     Purely from INSTANCE/TARGETFIELD/SOURCEFIELD definitions (fast, no tracing).
+
+    Keyed by instance name (not just table/field) so that when the SAME
+    physical table is written or read by more than one INSTANCE within a
+    single mapping, all contributing instance names are preserved instead
+    of being silently collapsed into one anonymous table/field pair.
     """
     mapping_node = folder_idx["mappings"].get(mapping_name)
     if mapping_node is None:
-        return set(), set()
+        return {}, {}
     m = index_mapping(mapping_node)
-    writes, reads = set(), set()
+    writes, reads = defaultdict(set), defaultdict(set)
     for inst_name, inst in m["instances"].items():
         if inst["type"] == "TARGET":
             tdef = folder_idx["targets"].get(inst["transformation_name"])
             if tdef:
                 for fld in tdef["fields"]:
-                    writes.add((tdef["table"], fld))
+                    writes[(tdef["table"], fld)].add(inst_name)
         elif inst["type"] == "SOURCE":
             sdef = folder_idx["sources"].get(inst["transformation_name"])
             if sdef:
                 for fld in sdef["fields"]:
-                    reads.add((sdef["table"], fld))
-    return writes, reads
+                    reads[(sdef["table"], fld)].add(inst_name)
+    return dict(writes), dict(reads)
 
 
 def find_target_instance(folder_idx, target_instance_name):
@@ -276,7 +282,8 @@ def find_target_instance(folder_idx, target_instance_name):
     return matches
 
 
-def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefix="lineage"):
+def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefix="lineage",
+                   out_dir=None):
     data = load_repo(json_path)
     folders = get_folders(data)
     if not folders:
@@ -344,15 +351,21 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
     for o, s, mp in in_scope:
         rw_cache[s] = session_read_write_sets(folder_idx, mp)
 
-    # index: which session (in scope) WRITES a given (table, field) -> list of (order, session, mapping)
+    # index: which session (in scope) WRITES a given (table, field) -> list of
+    # (order, session, mapping, instance_names). instance_names is a sorted
+    # tuple of every INSTANCE (within that session's mapping) that writes/reads
+    # this table+field -- if it has more than one entry, that table+field is
+    # ambiguous (multiple instances in the same mapping touch the same
+    # physical table/field) and every candidate is surfaced rather than
+    # silently picking one.
     writers_of = defaultdict(list)
     readers_of = defaultdict(list)
     for o, s, mp in in_scope:
         writes, reads = rw_cache[s]
-        for tf in writes:
-            writers_of[tf].append((o, s, mp))
-        for tf in reads:
-            readers_of[tf].append((o, s, mp))
+        for tf, inst_names in writes.items():
+            writers_of[tf].append((o, s, mp, tuple(sorted(inst_names))))
+        for tf, inst_names in reads.items():
+            readers_of[tf].append((o, s, mp, tuple(sorted(inst_names))))
     for k in writers_of:
         writers_of[k].sort()
     for k in readers_of:
@@ -391,19 +404,35 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
                     src_field = leaf.get("source_field")
 
                     prev_session = prev_mapping = prev_order = prev_table = prev_field = ""
+                    prev_instance = ""
                     if src_table and src_field:
                         cands = [w for w in writers_of.get((src_table, src_field), []) if w[0] < o]
                         if cands:
-                            p_o, p_s, p_mp = cands[-1]  # closest predecessor
+                            p_o, p_s, p_mp, p_insts = cands[-1]  # closest predecessor
                             prev_session, prev_mapping, prev_order = p_s, p_mp, p_o
                             prev_table, prev_field = src_table, src_field
+                            # more than one instance in the predecessor mapping
+                            # writes this same table+field -> surface all of
+                            # them instead of guessing which one is "the" source
+                            prev_instance = ", ".join(p_insts)
 
                     next_session = next_mapping = next_order = next_table = next_field = ""
+                    next_instance = ""
                     cands = [r for r in readers_of.get((target_table, field), []) if r[0] > o]
                     if cands:
-                        n_o, n_s, n_mp = cands[0]  # closest successor
+                        n_o, n_s, n_mp, n_insts = cands[0]  # closest successor
                         next_session, next_mapping, next_order = n_s, n_mp, n_o
                         next_table, next_field = target_table, field
+                        next_instance = ", ".join(n_insts)
+
+                    # how many TARGET instances in *this* mapping write to this
+                    # same (target_table, field) -- flags same-table/multi-instance
+                    # ambiguity happening within the current mapping itself
+                    same_table_instances = sorted(
+                        {n for o2, s2, mp2, insts in writers_of.get((target_table, field), [])
+                         if mp2 == mapping_name for n in insts}
+                    )
+                    target_instance_ambiguous = "Yes" if len(same_table_instances) > 1 else "No"
 
                     edge_id += 1
                     rows.append({
@@ -418,16 +447,20 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
                         "Target_Instance_Name": inst_name,
                         "Target Table": target_table,
                         "Target Field": field,
+                        "Target_Table_Multi_Instance": target_instance_ambiguous,
+                        "Target_Table_Instance_Names": ", ".join(same_table_instances),
                         "Prev_session_name": prev_session,
                         "Prev_mapping_name": prev_mapping,
                         "Prev_Mapping_Execution_Order": prev_order,
                         "Prev_Target_table_name": prev_table,
                         "Prev_Target_table_attribute": prev_field,
+                        "Prev_Target_Instance_Name": prev_instance,
                         "next_session_name": next_session,
                         "next_mapping_name": next_mapping,
                         "Next_Mapping_Execution_Order": next_order,
                         "next_Source_table_name": next_table,
                         "next_Source_table_attribute": next_field,
+                        "next_Source_Instance_Name": next_instance,
                     })
 
     df = pd.DataFrame(rows)
@@ -436,10 +469,11 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
         "Source_Instance_Name", "Source Table", "Source Field Name",
         "Transformation Lineage",
         "Target_Instance_Name", "Target Table", "Target Field",
+        "Target_Table_Multi_Instance", "Target_Table_Instance_Names",
         "Prev_session_name", "Prev_mapping_name", "Prev_Mapping_Execution_Order",
-        "Prev_Target_table_name", "Prev_Target_table_attribute",
+        "Prev_Target_table_name", "Prev_Target_table_attribute", "Prev_Target_Instance_Name",
         "next_session_name", "next_mapping_name", "Next_Mapping_Execution_Order",
-        "next_Source_table_name", "next_Source_table_attribute",
+        "next_Source_table_name", "next_Source_table_attribute", "next_Source_Instance_Name",
     ]
     df_out = df[col_order].drop_duplicates().reset_index(drop=True)
     df_out["Edge_ID"] = range(1, len(df_out) + 1)
@@ -448,9 +482,25 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
     # not scoped to the anchor run) - dedup by transformation name.
     df_catalog = pd.DataFrame(build_transformation_catalog(folder_idx))
 
-    csv_path = f"/mnt/user-data/outputs/{out_prefix}.csv"
-    xlsx_path = f"/mnt/user-data/outputs/{out_prefix}.xlsx"
-    html_path = f"/mnt/user-data/outputs/{out_prefix}.html"
+    # Resolve the output directory. `/mnt/user-data/outputs` only exists inside
+    # Claude's sandbox -- on a normal machine (Windows, Mac, Linux) it doesn't
+    # exist, which is exactly what caused the OSError. Instead:
+    #   1. use --outdir if the user passed one
+    #   2. otherwise use that sandbox path IF it's actually present
+    #   3. otherwise fall back to an "output" folder next to this script
+    # and always create the directory if it's missing.
+    if out_dir:
+        resolved_out_dir = out_dir
+    elif os.path.isdir("/mnt/user-data/outputs"):
+        resolved_out_dir = "/mnt/user-data/outputs"
+    else:
+        resolved_out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+    os.makedirs(resolved_out_dir, exist_ok=True)
+
+    csv_path = os.path.join(resolved_out_dir, f"{out_prefix}.csv")
+    xlsx_path = os.path.join(resolved_out_dir, f"{out_prefix}.xlsx")
+    html_path = os.path.join(resolved_out_dir, f"{out_prefix}.html")
 
     df_out.to_csv(csv_path, index=False)
     try:
@@ -480,6 +530,10 @@ if __name__ == "__main__":
     ap.add_argument("json_path")
     ap.add_argument("target_instance_name")
     ap.add_argument("--workflow", default=None)
-    ap.add_argument("--out", default="lineage")
+    ap.add_argument("--out", default="lineage", help="Output filename prefix (e.g. 'lineage' -> lineage.csv/.xlsx/.html)")
+    ap.add_argument("--outdir", default=None,
+                     help="Directory to write outputs into. Defaults to an 'output' "
+                          "folder next to this script (or /mnt/user-data/outputs if that "
+                          "sandbox path exists). Created automatically if missing.")
     args = ap.parse_args()
-    build_lineage(args.json_path, args.target_instance_name, args.workflow, args.out)
+    build_lineage(args.json_path, args.target_instance_name, args.workflow, args.out, args.outdir)
