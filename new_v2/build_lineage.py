@@ -139,7 +139,7 @@ function hopCellHtml(chainStr){
   return parts.map(p => {
     const m = p.match(/^(.*)\[(.*)\]$$/);
     const name = m ? m[1] : p;
-    return '<span class="hop" onclick="jumpToTransform(' + JSON.stringify(name) + ')">' + escapeHtml(p) + '</span>';
+    return '<span class="hop" data-name="' + escapeHtml(name) + '">' + escapeHtml(p) + '</span>';
   }).join('<span class="arrow">&rarr;</span>');
 }
 
@@ -206,6 +206,11 @@ function jumpToTransform(name){
     }
   }, 30);
 }
+
+document.getElementById('lineage-body').addEventListener('click', function(e){
+  const hop = e.target.closest('.hop');
+  if(hop) jumpToTransform(hop.dataset.name);
+});
 
 renderLineage();
 renderCatalog();
