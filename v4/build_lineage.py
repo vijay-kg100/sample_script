@@ -13,6 +13,7 @@ from lineage_engine import (
     format_lineage_chain, format_lineage_chain_data, build_transformation_catalog,
     CATALOG_DISPLAY_COLS,
     build_mapplet_catalog, MAPPLET_CATALOG_DISPLAY_COLS,
+    build_mapplet_transformation_catalog, MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS,
 )
 
 
@@ -101,13 +102,16 @@ _HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <header>
   <h1>$title</h1>
   <p>Tab 1: field-level lineage. Tab 2: transformation catalog. Tab 3: mapplet boundary-to-boundary
-     field paths. Click any hop in a Transformation Lineage chain to jump to its row in the
-     catalog (or, for a "[Mapplet]" hop, to its paths in Tab 3).</p>
+     field paths. Tab 4: transformations living inside each mapplet. Click any hop in a
+     Transformation Lineage chain to jump to its row in the catalog (or, for a "[Mapplet]" hop, to
+     its paths in Tab 3). Click any hop inside a Tab 3 row's Transformation_lineage to jump to
+     Tab 4 (mapplet-internal hops) or back to Tab 2 (hops outside the mapplet boundary).</p>
 </header>
 <div class="tabs">
   <button class="tab-btn active" data-tab="lineage" onclick="showTab('lineage')">Lineage ($n_lineage rows)</button>
   <button class="tab-btn" data-tab="catalog" onclick="showTab('catalog')">Transformations ($n_catalog rows)</button>
 $mapplets_tab_button
+$mapplet_transforms_tab_button
 </div>
 
 <div id="lineage" class="panel active">
@@ -141,13 +145,17 @@ $mapplets_tab_button
 
 $mapplets_panel
 
+$mapplet_transforms_panel
+
 <script>
 const LINEAGE_COLS = $lineage_cols;
 const CATALOG_COLS = $catalog_cols;
 const MAPPLET_COLS = $mapplet_cols;
+const MAPPLET_TRANSFORM_COLS = $mapplet_transform_cols;
 const lineageRows = $lineage_rows;
 const catalogRows = $catalog_rows;
 const mappletRows = $mapplet_rows;
+const mappletTransformRows = $mapplet_transform_rows;
 const PAGE_SIZE = 100;
 let lineagePageNum = 0;
 
@@ -174,7 +182,9 @@ function hopCellHtml(chainStr, hopsData){
     const data = hopsData[idx] || {};
     const field = data.field || '';
     const mapping = data.mapping || '';
+    const mapplet = data.mapplet || '';
     const type = data.type || '';
+    const scope = data.scope || '';
     // Prefer the structured name from hopsData (always in sync with the
     // display string). Fallback only strips the "[Type]" suffix and any
     // ".field" suffix before it, for the rare case hopsData is missing.
@@ -186,12 +196,15 @@ function hopCellHtml(chainStr, hopsData){
         ? beforeBracket.slice(0, -(field.length + 1))
         : beforeBracket;
     }
-    // Attaches Transformation Name + Field + Mapping (+ Type) so the Engine
-    // knows exactly which Tab-2 row to highlight, even when the same
-    // instance name is reused (with different logic) across different
-    // mappings - and, for a "[Mapplet]" hop, routes to Tab-3 instead.
+    // Attaches Transformation Name + Field + Mapping/Mapplet (+ Type/Scope)
+    // so the Engine knows exactly which row to highlight, even when the
+    // same instance name is reused (with different logic) elsewhere -
+    // for a "[Mapplet]" hop (Tab-1), routes to Tab-3; for a scope="mapplet"
+    // hop (Tab-3's own Transformation_lineage), routes to Tab-4; anything
+    // else with a mapping routes to Tab-2.
     return '<span class="hop" data-name="' + escapeHtml(name) + '" data-field="' + escapeHtml(field) +
-           '" data-mapping="' + escapeHtml(mapping) + '" data-type="' + escapeHtml(type) +
+           '" data-mapping="' + escapeHtml(mapping) + '" data-mapplet="' + escapeHtml(mapplet) +
+           '" data-type="' + escapeHtml(type) + '" data-scope="' + escapeHtml(scope) +
            '">' + escapeHtml(p) + '</span>';
   }).join('<span class="arrow">&rarr;</span>');
 }
@@ -202,10 +215,11 @@ function filterRows(rows, cols, query){
   return rows.filter(r => cols.some(c => String(r[c] ?? '').toLowerCase().includes(q)));
 }
 
-// --- Per-column (Excel-style) filters, generalized across all three
-// tables (Tab-1 Lineage, Tab-2 Transformations, Tab-3 Mapplets) ---
+// --- Per-column (Excel-style) filters, generalized across all four
+// tables (Tab-1 Lineage, Tab-2 Transformations, Tab-3 Mapplets, Tab-4
+// Mapplet_Transformations) ---
 // tableKey -> { colName -> Set of allowed string values } (col absent = no filter)
-const columnFilters = {lineage: {}, catalog: {}, mapplets: {}};
+const columnFilters = {lineage: {}, catalog: {}, mapplets: {}, mapplet_transforms: {}};
 // tableKey -> {rows, cols, rerender, resetPage} - registered by each
 // render*Head() call so the shared dropdown logic can drive any table.
 const filterableTables = {};
@@ -433,12 +447,72 @@ function renderMapplets(){
     const rid = 'mp-' + r.__id;
     return '<tr id="' + rid + '" class="id-row">' + MAPPLET_COLS.map(c => {
       if(c === 'Transformation_lineage') {
-        return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
+        let hopsData = [];
+        try { hopsData = JSON.parse(r['_Transformation_lineage_data'] || '[]'); } catch(e){}
+        return '<td class="logic-cell">' + hopCellHtml(r[c], hopsData) + '</td>';
       }
       return '<td>' + escapeHtml(r[c] ?? '') + '</td>';
     }).join('') + '</tr>';
   }).join('');
   document.getElementById('mapplet-count').textContent = filtered.length + ' matching row(s)';
+}
+
+function renderMappletTransforms(){
+  // Tab-4 only exists in the DOM when the repository actually contains
+  // mapplet-internal transformations (mirrors Tab-3's improvement-5 guard)
+  // - no-op otherwise so init/search calls never throw on a missing element.
+  const searchEl = document.getElementById('mapplet-transform-search');
+  if(!searchEl) return;
+  const q = searchEl.value;
+  let filtered = mappletTransformRows.filter(r => rowMatchesColumnFilters('mapplet_transforms', r));
+  filtered = filterRows(filtered, MAPPLET_TRANSFORM_COLS, q);
+  renderHeadWithFilters('mapplet_transforms', document.getElementById('mapplet-transform-head'),
+                         MAPPLET_TRANSFORM_COLS, mappletTransformRows, renderMappletTransforms, null);
+  document.getElementById('mapplet-transform-body').innerHTML = filtered.map(r => {
+    const rid = 'mpt-' + r.__id;
+    return '<tr id="' + rid + '" class="id-row">' + MAPPLET_TRANSFORM_COLS.map(c => {
+      if(c === 'Business Logic') {
+        return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
+      }
+      return '<td>' + escapeHtml(r[c] ?? '') + '</td>';
+    }).join('') + '</tr>';
+  }).join('');
+  document.getElementById('mapplet-transform-count').textContent = filtered.length + ' matching row(s)';
+}
+
+function jumpToMappletTransform(name, field, mapplet){
+  if(!document.getElementById('mapplet_transforms')) return; // no Tab-4 in this report
+  showTab('mapplet_transforms');
+  document.getElementById('mapplet-transform-search').value = '';
+  renderMappletTransforms();
+
+  // Best match: exact Transformation + Port + Mapplet (handles the same
+  // instance name being reused with different logic in different mapplets).
+  let target = mappletTransformRows.find(r =>
+    r['Transformation Name'] === name && r._Port === field && r._Mapplet === mapplet);
+
+  // Fallback: Transformation + Port, ignoring mapplet
+  if(!target){
+    target = mappletTransformRows.find(r => r['Transformation Name'] === name && r._Port === field);
+  }
+  // Last resort: name alone
+  if(!target){
+    target = mappletTransformRows.find(r => r['Transformation Name'] === name);
+  }
+
+  const rid = target ? 'mpt-' + target.__id : null;
+  setTimeout(() => {
+    let el = rid && document.getElementById(rid);
+    if(!el){
+      document.getElementById('mapplet-transform-search').value = name;
+      renderMappletTransforms();
+      el = rid && document.getElementById(rid);
+    }
+    if(el){
+      el.scrollIntoView({behavior:'smooth', block:'center'});
+      el.classList.remove('hit'); void el.offsetWidth; el.classList.add('hit');
+    }
+  }, 30);
 }
 
 function jumpToMapplet(name, field, mapping){
@@ -523,10 +597,28 @@ document.getElementById('lineage-body').addEventListener('click', function(e){
   }
 });
 
+// Tab-3's own Transformation_lineage hops route by scope instead of type:
+// scope="mapplet" hops live inside the mapplet boundary -> Tab-4; anything
+// else (scope="mapping", the Upstream/Downstream HOP ends outside the
+// mapplet) -> Tab-2, same destination a Tab-1 non-Mapplet hop would use.
+const mappletBody = document.getElementById('mapplet-body');
+if(mappletBody){
+  mappletBody.addEventListener('click', function(e){
+    const hop = e.target.closest('.hop');
+    if(!hop) return;
+    if(hop.dataset.scope === 'mapplet'){
+      jumpToMappletTransform(hop.dataset.name, hop.dataset.field, hop.dataset.mapplet);
+    } else {
+      jumpToTransform(hop.dataset.name, hop.dataset.field, hop.dataset.mapping);
+    }
+  });
+}
+
 renderLineageHead();
 renderLineage();
 renderCatalog();
 renderMapplets();
+renderMappletTransforms();
 </script>
 </body>
 </html>
@@ -550,18 +642,41 @@ _MAPPLETS_PANEL_TMPL = """<div id="mapplets" class="panel">
   </table></div>
 </div>"""
 
+_MAPPLET_TRANSFORMS_TAB_BUTTON_TMPL = (
+    '<button class="tab-btn" data-tab="mapplet_transforms" onclick="showTab(\'mapplet_transforms\')">'
+    'Mapplet_Transformations ({n} rows)</button>'
+)
 
-def write_html_report(df_lineage, df_catalog, df_mapplet, out_path, title="Lineage Report",
-                       has_mapplets=False):
-    # Tab-3 (Mapplets) markup is only emitted at all when the repository
-    # actually contains Mapplets reachable from this report (improvement-5).
-    # When absent, both placeholders resolve to "" so no tab button, no
-    # panel, and (via renderMapplets()'s own element-existence guard) no JS
-    # error at init time either.
+_MAPPLET_TRANSFORMS_PANEL_TMPL = """<div id="mapplet_transforms" class="panel">
+  <div class="toolbar">
+    <input type="text" id="mapplet-transform-search" placeholder="Filter mapplet transformations..."
+           oninput="renderMappletTransforms()">
+    <span class="count" id="mapplet-transform-count"></span>
+    <span class="count">Click &#9662; on any column header to filter its values</span>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr id="mapplet-transform-head"></tr></thead>
+    <tbody id="mapplet-transform-body"></tbody>
+  </table></div>
+</div>"""
+
+
+def write_html_report(df_lineage, df_catalog, df_mapplet, df_mapplet_transform, out_path,
+                       title="Lineage Report", has_mapplets=False, has_mapplet_transforms=False):
+    # Tab-3 (Mapplets) / Tab-4 (Mapplet_Transformations) markup is only
+    # emitted at all when the repository actually contains the relevant data
+    # (improvement-5). When absent, the placeholders resolve to "" so no tab
+    # button, no panel, and (via each render*()'s own element-existence
+    # guard) no JS error at init time either.
     mapplets_tab_button = (
         _MAPPLETS_TAB_BUTTON_TMPL.format(n=len(df_mapplet)) if has_mapplets else ""
     )
     mapplets_panel = _MAPPLETS_PANEL_TMPL if has_mapplets else ""
+    mapplet_transforms_tab_button = (
+        _MAPPLET_TRANSFORMS_TAB_BUTTON_TMPL.format(n=len(df_mapplet_transform))
+        if has_mapplet_transforms else ""
+    )
+    mapplet_transforms_panel = _MAPPLET_TRANSFORMS_PANEL_TMPL if has_mapplet_transforms else ""
 
     cat = df_catalog.copy()
     # Composite key unique to Transformation Name + Mapping + Port, so that
@@ -580,11 +695,25 @@ def write_html_report(df_lineage, df_catalog, df_mapplet, out_path, title="Linea
     # field each land on their own row id.
     if "_Mapplet_Instance" not in mpl.columns:
         mpl["_Mapplet_Instance"] = ""
+    if "_Transformation_lineage_data" not in mpl.columns:
+        mpl["_Transformation_lineage_data"] = "[]"
     mpl["__id"] = (
         mpl["Mapping_Name"].astype(str) + "_" +
         mpl["_Mapplet_Instance"].astype(str) + "_" +
         mpl["Output Transformation Field"].astype(str) + "_" +
         mpl["Input Transformation Field"].astype(str)
+    ).apply(_safe_id)
+
+    mpt = df_mapplet_transform.copy()
+    # Composite key unique to Mapplet Name + Transformation Name + Port, so
+    # that the SAME instance name reused (with different logic) across
+    # different mapplets gets its own row id instead of colliding.
+    if "_Mapplet" not in mpt.columns:
+        mpt["_Mapplet"] = ""
+    mpt["__id"] = (
+        mpt["Mapplet Name"].astype(str) + "_" +
+        mpt["Transformation Name"].astype(str) + "_" +
+        mpt["_Port"].astype(str)
     ).apply(_safe_id)
 
     html = _HTML_TEMPLATE.substitute(
@@ -594,12 +723,16 @@ def write_html_report(df_lineage, df_catalog, df_mapplet, out_path, title="Linea
         n_mapplet=len(df_mapplet),
         mapplets_tab_button=mapplets_tab_button,
         mapplets_panel=mapplets_panel,
+        mapplet_transforms_tab_button=mapplet_transforms_tab_button,
+        mapplet_transforms_panel=mapplet_transforms_panel,
         lineage_cols=json.dumps(list(df_lineage.columns)),
         catalog_cols=json.dumps(CATALOG_DISPLAY_COLS),
         mapplet_cols=json.dumps(MAPPLET_CATALOG_DISPLAY_COLS),
+        mapplet_transform_cols=json.dumps(MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS),
         lineage_rows=json.dumps(df_lineage.to_dict(orient="records")),
         catalog_rows=json.dumps(cat.to_dict(orient="records")),
         mapplet_rows=json.dumps(mpl.to_dict(orient="records")),
+        mapplet_transform_rows=json.dumps(mpt.to_dict(orient="records")),
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -951,6 +1084,27 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
     df_mapplet_display = df_mapplet[MAPPLET_CATALOG_DISPLAY_COLS]
     has_mapplets = len(df_mapplet) > 0
 
+    # Tab-4: transformations living INSIDE mapplet definitions (see
+    # requirement item (e)). Same catalog structure/dedup pattern as Tab-2,
+    # scoped by mapplet instead of by mapping; df_mapplet_transform carries a
+    # hidden _Mapplet/_Port bookkeeping pair (mirrors df_catalog's
+    # _Mapping/_Port pattern) so the HTML report can jump straight from a
+    # Tab-3 row's Transformation_lineage hop to its matching Tab-4 row(s);
+    # df_mapplet_transform_display is the user-facing 8-column view used for
+    # Excel/CSV. Only populated when the repository actually contains any
+    # mapplet-internal transformation logic - an empty result means Tab-4 is
+    # entirely omitted downstream, same convention as Tab-3.
+    mapplet_transform_rows = build_mapplet_transformation_catalog(folder_idx)
+    if mapplet_transform_rows:
+        df_mapplet_transform_full = pd.DataFrame(mapplet_transform_rows)
+        df_mapplet_transform = df_mapplet_transform_full.drop_duplicates(
+            subset=MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS).reset_index(drop=True)
+    else:
+        df_mapplet_transform = pd.DataFrame(
+            columns=MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS + ["_Mapplet", "_Port"])
+    df_mapplet_transform_display = df_mapplet_transform[MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS]
+    has_mapplet_transforms = len(df_mapplet_transform) > 0
+
     if out_dir:
         resolved_out_dir = out_dir
     elif os.path.isdir("/mnt/user-data/outputs"):
@@ -974,13 +1128,16 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
             df_catalog_display.to_excel(writer, sheet_name="Transformations", index=False)
             if has_mapplets:
                 df_mapplet_display.to_excel(writer, sheet_name="Mapplets", index=False)
+            if has_mapplet_transforms:
+                df_mapplet_transform_display.to_excel(writer, sheet_name="Mapplet_Transformations", index=False)
     except Exception as e:
         print("xlsx export skipped:", e)
 
     html_written = False
     try:
-        write_html_report(df_out, df_catalog, df_mapplet, html_path,
-                           title=f"Lineage: {target_instance_name}", has_mapplets=has_mapplets)
+        write_html_report(df_out, df_catalog, df_mapplet, df_mapplet_transform, html_path,
+                           title=f"Lineage: {target_instance_name}", has_mapplets=has_mapplets,
+                           has_mapplet_transforms=has_mapplet_transforms)
         html_written = True
     except Exception as e:
         print("html export skipped:", e)
@@ -988,12 +1145,13 @@ def build_lineage(json_path, target_instance_name, workflow_name=None, out_prefi
     print(f"\nRows produced: {len(df_out)}")
     print(f"Transformations catalogued (Port-level, deduplicated): {len(df_catalog)}")
     print(f"Mapplet field paths catalogued (deduplicated): {len(df_mapplet)}")
+    print(f"Mapplet-internal transformations catalogued (deduplicated): {len(df_mapplet_transform)}")
     print(f"Sessions in scope (1..{anchor_order}): {len(in_scope)}")
     print(f"Wrote: {csv_path}")
     print(f"Wrote: {xlsx_path}")
     if html_written:
         print(f"Wrote: {html_path}")
-    return df_out, df_catalog, df_mapplet
+    return df_out, df_catalog, df_mapplet, df_mapplet_transform
 
 
 if __name__ == "__main__":

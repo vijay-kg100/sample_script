@@ -854,14 +854,25 @@ def format_lineage_chain_data(path, mapping_name=""):
     AND mapping to look for in Tab 2. The mapping is required for correct
     navigation: the same instance name can exist with completely different
     logic in a different mapping."""
+    return json.dumps(_lineage_chain_hops(path, {"mapping": mapping_name, "scope": "mapping"}))
+
+
+def _lineage_chain_hops(path, extra=None):
+    """Shared helper behind format_lineage_chain_data (Tab-1) and the Tab-3
+    mapplet-internal chain builder: turns a raw trace path into the ordered
+    list of hop dicts (source -> target), each hop's own name/type/field
+    merged with whatever fixed context fields the caller passes in `extra`
+    (mapping/mapplet name, "scope" routing hint, etc.) - one call site per
+    provenance of the hops, so a chain that mixes hops from more than one
+    scope can be assembled by calling this once per segment."""
     if not path:
-        return "[]"
+        return []
     groups = _group_hops(path)
-    parsed_hops = [
-        {"name": name, "type": ttype, "field": field, "mapping": mapping_name}
+    extra = extra or {}
+    return [
+        {"name": name, "type": ttype, "field": field, **extra}
         for name, ttype, field in reversed(groups)
     ]
-    return json.dumps(parsed_hops)
 
 
 # --------------------------------------------------------------------------
@@ -884,26 +895,42 @@ CATALOG_DISPLAY_COLS = [
 ]
 
 
-def build_transformation_catalog(folder_idx):
-    """Folder-wide catalog of every transformation INSTANCE.
+def _build_instance_catalog_rows(scope_items, folder_idx, scope_bookkeeping_col,
+                                  visible_scope_col=None):
+    """Shared implementation behind both the Tab-2 "Transformations" catalog
+    (scope = mapping) and the Tab-4 "Mapplet_Transformations" catalog
+    (scope = mapplet). Structurally identical either way: a MAPPING and a
+    MAPPLET are indexed the same way via index_mapping(), so "scope" here
+    just means "whichever of the two we were handed".
 
-    Returns one row per (mapping, instance, output/variable port) - i.e. one
+    Returns one row per (scope, instance, output/variable port) - i.e. one
     row per distinct piece of business logic. Instance names are only unique
-    WITHIN a single mapping (the same instance name, especially for
+    WITHIN a single scope (the same instance name, especially for
     non-reusable / locally-overridden transformations, can legitimately
-    carry completely different logic in a different mapping), so rows are
-    never collapsed across mappings - each occurrence gets its own row with
-    its own Input/Output/Custom-Variable ports.
+    carry completely different logic in a different mapping/mapplet), so
+    rows are never collapsed across scopes - each occurrence gets its own
+    row with its own Input/Output/Custom-Variable ports.
 
     Pure pass-through INPUT ports (no expression, nothing computed) don't
     get their own row - they only show up in the "Input Ports" list of
     whichever output/variable row actually consumes them.
+
+    scope_items: iterable of (scope_name, scope_node), e.g.
+                 folder_idx["mappings"].items() or folder_idx["mapplets"].items()
+    scope_bookkeeping_col: bookkeeping column name the scope name is stored
+                 under on every row ("_Mapping" for Tab-2, "_Mapplet" for
+                 Tab-4) - used together with "_Port" for unambiguous
+                 click-to-navigate matching.
+    visible_scope_col: if given, the scope name is ALSO stored under this
+                 user-facing display column name (Tab-4's "Mapplet Name").
+                 Tab-2 leaves this None, matching its existing behaviour of
+                 not surfacing a visible mapping column.
     """
 
     rows = []
 
-    for mapping_name, mapping_node in folder_idx["mappings"].items():
-        m = index_mapping(mapping_node)
+    for scope_name, scope_node in scope_items:
+        m = index_mapping(scope_node)
         for inst_name, inst in m["instances"].items():
             if inst["type"] != "TRANSFORMATION":
                 continue
@@ -975,7 +1002,7 @@ def build_transformation_catalog(folder_idx):
                 if own_is_out and own_is_in:
                     addl_info.append("Pass-through port")
 
-                rows.append({
+                row = {
                     "Transformation Name": inst_name,
                     "Transformation Type": ttype,
                     "Business Logic": "\n".join(logic_lines),
@@ -983,9 +1010,24 @@ def build_transformation_catalog(folder_idx):
                     "Input Ports": ", ".join(sorted(in_ports)),
                     "Output Ports": ", ".join(sorted(out_ports)),
                     "Custom / Variable Ports": ", ".join(sorted(var_ports)),
-                    "_Mapping": mapping_name,
+                    scope_bookkeeping_col: scope_name,
                     "_Port": port_name,
-                })
+                }
+                if visible_scope_col:
+                    row[visible_scope_col] = scope_name
+                rows.append(row)
+
+    return rows
+
+
+def build_transformation_catalog(folder_idx):
+    """Folder-wide catalog of every transformation INSTANCE, one row per
+    (mapping, instance, output/variable port). See
+    _build_instance_catalog_rows for the shared row-building logic."""
+
+    rows = _build_instance_catalog_rows(
+        folder_idx["mappings"].items(), folder_idx, scope_bookkeeping_col="_Mapping",
+    )
 
     # De-duplicate identical rows (improvement-3). Dedup key includes the
     # bookkeeping _Mapping/_Port columns so legitimately distinct
@@ -1005,6 +1047,60 @@ def build_transformation_catalog(folder_idx):
     # keeps every mapping's occurrence of a reused instance name grouped
     # together but still distinct.
     return sorted(deduped, key=lambda r: (r["Transformation Name"], r["_Mapping"], r["_Port"]))
+
+
+# --------------------------------------------------------------------------
+# 6b. Mapplet-internal transformation catalog (Tab-4)
+# --------------------------------------------------------------------------
+
+# Same shape as CATALOG_DISPLAY_COLS (Tab-2), plus a leading "Mapplet Name"
+# column so rows from different mapplet definitions are distinguishable -
+# Tab-3 already surfaces "Mapplet_name" per row, so Tab-4 carries the same
+# label through for consistency.
+MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS = [
+    "Mapplet Name",
+    "Transformation Name",
+    "Transformation Type",
+    "Business Logic",
+    "Additional Informations",
+    "Input Ports",
+    "Output Ports",
+    "Custom / Variable Ports",
+]
+
+
+def build_mapplet_transformation_catalog(folder_idx):
+    """Tab-4: catalog of every transformation INSTANCE that lives INSIDE a
+    Mapplet definition (as opposed to Tab-2, which catalogs transformation
+    instances inside Mappings). One row per (mapplet, instance,
+    output/variable port) - same "same format as Tab-2" structure, just
+    scoped by mapplet instead of by mapping, with the mapplet name carried
+    as a visible column so rows are distinguishable across mapplets.
+
+    A mapplet definition is parsed exactly once here regardless of how many
+    mappings drop it in as an instance (matches Tab-2's Mapping-level
+    granularity: Tab-2 doesn't duplicate itself per session either).
+    """
+
+    rows = _build_instance_catalog_rows(
+        folder_idx.get("mapplets", {}).items(), folder_idx,
+        scope_bookkeeping_col="_Mapplet", visible_scope_col="Mapplet Name",
+    )
+
+    # De-duplicate identical rows (improvement-3), mirroring Tab-2's dedup:
+    # keyed on the bookkeeping _Mapplet/_Port columns too, so legitimately
+    # distinct occurrences are never collapsed together.
+    dedup_cols = MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS + ["_Mapplet", "_Port"]
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = tuple(r[c] for c in dedup_cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    return sorted(deduped, key=lambda r: (r["Mapplet Name"], r["Transformation Name"], r["_Port"]))
 
 
 # --------------------------------------------------------------------------
@@ -1117,14 +1213,39 @@ def build_mapplet_catalog(folder_idx):
                     internal_chain = format_lineage_chain(internal_path)
                     if internal_chain:
                         parts = [internal_chain]
+                        # scope="mapplet": these hops live INSIDE mapplet_def,
+                        # so a UI click on one of them must jump to Tab-4
+                        # (mapplet-internal transformation catalog), not Tab-2.
+                        internal_hops = _lineage_chain_hops(
+                            internal_path, {"mapplet": mapplet_def, "scope": "mapplet"})
                     else:
                         parts = [f"{in_instance}.{internal_in_field}[Input Transformation]"]
+                        internal_hops = [{
+                            "name": in_instance, "type": "Input Transformation",
+                            "field": internal_in_field, "mapplet": mapplet_def, "scope": "mapplet",
+                        }]
                     parts.append(f"{out_instance}.{internal_out_field}[Output Transformation]")
+                    internal_hops.append({
+                        "name": out_instance, "type": "Output Transformation",
+                        "field": internal_out_field, "mapplet": mapplet_def, "scope": "mapplet",
+                    })
                     lineage_str = " -> ".join(parts)
+                    hops_data = list(internal_hops)
                     if prev_name:
                         lineage_str = f"{prev_name}.{prev_field}[{prev_type}] -> " + lineage_str
+                        # scope="mapping": this hop sits OUTSIDE the mapplet,
+                        # at the enclosing mapping level, so it routes to
+                        # Tab-2 instead - same convention Tab-1 already uses.
+                        hops_data.insert(0, {
+                            "name": prev_name, "type": prev_type, "field": prev_field,
+                            "mapping": mapping_name, "scope": "mapping",
+                        })
                     if next_name:
                         lineage_str = lineage_str + f" -> {next_name}.{next_field}[{next_type}]"
+                        hops_data.append({
+                            "name": next_name, "type": next_type, "field": next_field,
+                            "mapping": mapping_name, "scope": "mapping",
+                        })
 
                     rows.append({
                         "Mapping_Name": mapping_name,
@@ -1141,6 +1262,12 @@ def build_mapplet_catalog(folder_idx):
                         # hop (which carries the mapplet INSTANCE name) to
                         # its Tab-3 rows.
                         "_Mapplet_Instance": inst_name,
+                        # bookkeeping only, not a display column - feeds the
+                        # HTML report's per-hop click routing (Tab-4 for
+                        # scope="mapplet" hops, Tab-2 for scope="mapping"
+                        # hops), mirroring Tab-1's "Transformation Lineage
+                        # Data" column.
+                        "_Transformation_lineage_data": json.dumps(hops_data),
                     })
 
     # De-duplicate identical rows (improvement-3): can arise when more than
