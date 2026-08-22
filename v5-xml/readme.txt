@@ -1,0 +1,1 @@
+   python build_lineage.py sample.json TARGET_TABLE TARGET_INSTANCE Target_Mapping --out lineage
