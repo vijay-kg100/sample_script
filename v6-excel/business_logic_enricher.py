@@ -383,8 +383,18 @@ def enrich_catalog_rows(rows, workbook, *, mapping_key="_Mapping", mapplet_mode=
     """Mutates `rows` (a list of dicts, as returned by
     lineage_engine.build_transformation_catalog / build_mapplet_transformation_catalog)
     in place, filling "Business Logic", "Additional Informations" and
-    "Category" from the user-supplied `workbook` ({sheet_name: DataFrame},
-    from load_source_workbook).
+    "Category" - Excel first, XML gap-fill:
+
+      1. Look up this row's (session, mapping/mapplet, transformation, port)
+         in the matching tab of the user-supplied `workbook`. If that tab
+         has a non-blank value, use it - Source is stamped "Excel (<tab>)".
+      2. Otherwise, fall back to the XML-derived text lineage_engine already
+         computed at catalog-build time (row["_XML_Business_Logic"] /
+         row["_XML_Additional_Info"]) - Source is stamped "XML - gap fill".
+      3. If NEITHER source has anything for this row, Business Logic stays
+         blank and Source is stamped "XML - lineage" (XML only confirmed
+         this port/instance exists and how it connects - no logic text was
+         available from either source).
 
     mapping_key: bookkeeping column on each row holding the mapping (Tab-2,
                  "_Mapping") or mapplet (Tab-4, "_Mapplet") scope name.
@@ -398,27 +408,22 @@ def enrich_catalog_rows(rows, workbook, *, mapping_key="_Mapping", mapplet_mode=
     """
     if not rows:
         return rows
-    if not workbook:
-        # No source workbook supplied - only compute Category, which relies
-        # solely on the already-available _Own_Expression bookkeeping field,
-        # never on the workbook.
-        for row in rows:
-            row["Category"] = "Involves Derivation" if row.get("_Own_Expression") else "Direct Pass through"
-        return rows
 
     sheet_index_cache = {}
 
     def get_index(ttype):
+        if not workbook:
+            return None, None
         sheet_name = _match_sheet_name(workbook, ttype, mapplet_mode)
         if not sheet_name:
-            return None
+            return None, None
         if sheet_name not in sheet_index_cache:
             sheet_index_cache[sheet_name] = _build_sheet_index(workbook[sheet_name])
-        return sheet_index_cache[sheet_name]
+        return sheet_name, sheet_index_cache[sheet_name]
 
     for row in rows:
         ttype = row.get("Transformation Type", "")
-        index = get_index(ttype)
+        sheet_name, index = get_index(ttype)
 
         matched_rows = []
         if index is not None:
@@ -431,11 +436,25 @@ def enrich_catalog_rows(rows, workbook, *, mapping_key="_Mapping", mapplet_mode=
                 session_v = _norm(session_lookup.get(scope_val, ""))
             matched_rows = _lookup(index, session_v, scope_v, trans_v, port_v)
 
-        biz, addl = _compute_business_fields(ttype, matched_rows)
+        biz, addl = _compute_business_fields(ttype, matched_rows) if matched_rows else ("", "")
+
         if biz:
+            # Excel had a usable value for this row - it wins outright,
+            # even if Additional Informations came back blank alongside it.
             row["Business Logic"] = biz
-        if addl:
-            row["Additional Informations"] = addl
+            if addl:
+                row["Additional Informations"] = addl
+            row["_Logic_Source"] = f"Excel ({sheet_name})"
+        else:
+            xml_biz = row.get("_XML_Business_Logic", "")
+            xml_addl = row.get("_XML_Additional_Info", "")
+            if xml_biz:
+                row["Business Logic"] = xml_biz
+                if xml_addl:
+                    row["Additional Informations"] = xml_addl
+                row["_Logic_Source"] = "XML - gap fill"
+            else:
+                row["_Logic_Source"] = "XML - lineage"
 
         row["Category"] = "Involves Derivation" if row.get("_Own_Expression") else "Direct Pass through"
 

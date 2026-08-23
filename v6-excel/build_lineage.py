@@ -14,6 +14,8 @@ from lineage_engine import (
     CATALOG_DISPLAY_COLS,
     build_mapplet_catalog, MAPPLET_CATALOG_DISPLAY_COLS,
     build_mapplet_transformation_catalog, MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS,
+    build_eligibility_catalog, ELIGIBILITY_CATALOG_DISPLAY_COLS,
+    build_eligibility_summary, ELIGIBILITY_SUMMARY_DISPLAY_COLS,
 )
 from business_logic_enricher import load_source_workbook, enrich_catalog_rows
 
@@ -1273,6 +1275,23 @@ def build_lineage(json_path, target_table_name, target_instance_name, target_map
     df_mapplet_transform_display = df_mapplet_transform[MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS]
     has_mapplet_transforms = len(df_mapplet_transform) > 0
 
+    # Eligibility Rules tab: scans the (now Excel-first/XML-gap-filled)
+    # catalog_rows and mapplet_transform_rows lists built/enriched just
+    # above and pulls out whatever looks like eligibility/qualification
+    # logic. Uses the FULL session_to_mapping map (every session across
+    # the workflow(s) in scope), not just the anchor-restricted `in_scope`
+    # subset, so this tab documents eligibility rules repository-wide
+    # rather than only upstream of the one target this run happens to be
+    # tracing.
+    eligibility_rows = build_eligibility_catalog(
+        catalog_rows, mapplet_transform_rows, folder_idx, session_to_mapping)
+    df_eligibility = pd.DataFrame(eligibility_rows, columns=ELIGIBILITY_CATALOG_DISPLAY_COLS)
+    has_eligibility = len(df_eligibility) > 0
+
+    eligibility_summary_rows = build_eligibility_summary(eligibility_rows)
+    df_eligibility_summary = pd.DataFrame(eligibility_summary_rows, columns=ELIGIBILITY_SUMMARY_DISPLAY_COLS)
+    has_eligibility_summary = len(df_eligibility_summary) > 0
+
     if out_dir:
         resolved_out_dir = out_dir
     elif os.path.isdir("/mnt/user-data/outputs"):
@@ -1298,6 +1317,13 @@ def build_lineage(json_path, target_table_name, target_instance_name, target_map
                 df_mapplet_display.to_excel(writer, sheet_name="Mapplets", index=False)
             if has_mapplet_transforms:
                 df_mapplet_transform_display.to_excel(writer, sheet_name="Mapplet_Transformations", index=False)
+            # Always write the "Eligibility Rules" tab, even when empty, so
+            # it's always present at a predictable name/position - an empty
+            # sheet with just headers signals "nothing matched" rather than
+            # "tab is missing".
+            df_eligibility.to_excel(writer, sheet_name="Eligibility Rules", index=False)
+            if has_eligibility_summary:
+                df_eligibility_summary.to_excel(writer, sheet_name="Eligibility Rules - Summary", index=False)
     except Exception as e:
         print("xlsx export skipped:", e)
 
@@ -1314,12 +1340,14 @@ def build_lineage(json_path, target_table_name, target_instance_name, target_map
     print(f"Transformations catalogued (Port-level, deduplicated): {len(df_catalog)}")
     print(f"Mapplet field paths catalogued (deduplicated): {len(df_mapplet)}")
     print(f"Mapplet-internal transformations catalogued (deduplicated): {len(df_mapplet_transform)}")
+    print(f"Eligibility rules found (Filter/Router/Expression/Lookup/Update Strategy/"
+          f"Source Qualifier/Mapplet-internal): {len(df_eligibility)}")
     print(f"Sessions in scope (1..{anchor_order}): {len(in_scope)}")
     print(f"Wrote: {csv_path}")
     print(f"Wrote: {xlsx_path}")
     if html_written:
         print(f"Wrote: {html_path}")
-    return df_out, df_catalog, df_mapplet, df_mapplet_transform
+    return df_out, df_catalog, df_mapplet, df_mapplet_transform, df_eligibility
 
 
 if __name__ == "__main__":
