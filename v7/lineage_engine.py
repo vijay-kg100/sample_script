@@ -1449,226 +1449,536 @@ def build_mapplet_catalog(folder_idx):
         r["Output Transformation Field"], r["Input Transformation Field"],
     ))
 
-
 # --------------------------------------------------------------------------
-# 8. Eligibility Rules catalog (new tab)
+# 8. Eligibility Rules extraction (Tab-5 "Eligibility Rules" / Tab-6
+#    "Eligibility Rules - Summary")
 # --------------------------------------------------------------------------
 #
-# Scans the same per-instance catalogs already built for Tab-2 (mapping
-# level) and Tab-4 (mapplet-internal level) and pulls out just the rows
-# that look like eligibility/qualification logic, per the "Where to look"
-# spec:
-#   Filter            -> filter condition
-#   Router            -> each group's condition
-#   Expression        -> IIF/DECODE/CASE-like logic on flag/indicator ports
-#   Lookup            -> lookup override SQL / lookup condition
-#   Update Strategy   -> conditional insert/update/reject logic
-#   Source Qualifier  -> SQL override / source filter WHERE clause
-#   Mapplets          -> same checks, recursively, on the mapplet's own
-#                        internal transformations (Tab-4), attributed back
-#                        to every mapping that calls the mapplet.
+# Scans every Filter / Router / Expression (incl. Aggregator) / Lookup /
+# Update Strategy / Source Qualifier / Transaction Control transformation
+# instance in every MAPPING, and repeats the same scan for every MAPPLET
+# reachable from that mapping (once per calling mapping, per the
+# requirement), looking for condition/expression text that determines
+# whether a record qualifies, is included, excluded, flagged, or routed
+# based on business criteria.
 #
-# Filter/Router/Lookup/Update Strategy/Source Qualifier are inherently
-# row-gating constructs, so any non-blank logic on them is taken as an
-# eligibility-rule candidate. Expression (and Joiner, which can implicitly
-# restrict which rows survive a join) are far noisier - most Expression
-# ports have nothing to do with eligibility - so those are only pulled in
-# when the port name or its logic text hits an eligibility-flavoured
-# keyword below.
+# "Structural" transformation types (Filter/Router/Update Strategy) are, by
+# definition, always about record disposition, so their conditions are
+# always reported when non-blank. Source Qualifier is reported when it
+# carries an actual WHERE-style filter (Source Filter, or a SQL
+# Override/User Defined Join containing a WHERE clause). Lookup,
+# Expression/Aggregator and Transaction Control conditions are reported
+# only when they match the eligibility keyword+control-logic heuristic
+# below, since most of their logic is plumbing rather than eligibility.
 
-ELIGIBILITY_GATING_TTYPES = (
-    "FILTER", "ROUTER", "LOOKUP", "UPDATE STRATEGY", "SOURCE QUALIFIER",
+ELIGIBILITY_KEYWORDS = {
+    "eligib", "qualif", "status", "active", "inactive", "flag", "flg", "ind",
+    "valid", "age", "dob", "birth", "threshold", "limit", "min_", "max_",
+    "tier", "segment", "plan_cd", "plan_code", "product_cd", "product_code",
+    "prod_cd", "effective_date", "eff_dt", "eff_date", "expir", "term_dt",
+    "termination", "exclud", "includ", "enroll", "member", "coverage",
+    "start_date", "end_date", "date_from", "date_to", "window", "grp",
+    "group_cd", "class_cd", "level", "band", "rank_cd", "reject", "approve",
+    "denied", "decline", "waiver", "grace", "lapse", "renew", "suspend",
+    "hold", "block", "risk", "score", "cutoff",
+}
+
+_SQL_ALIAS_STOPWORDS = {
+    "WHERE", "ON", "INNER", "LEFT", "RIGHT", "OUTER", "JOIN", "GROUP",
+    "ORDER", "HAVING", "UNION", "AND", "OR", "SET", "SELECT", "FROM",
+    "VALUES", "INTO", "AS",
+}
+
+_TABLE_ALIAS_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w\.]*)\s+(?:AS\s+)?([A-Za-z_]\w*)\b",
+    re.IGNORECASE,
 )
-ELIGIBILITY_CONDITIONAL_TTYPES = ("EXPRESSION", "JOINER")
-
-ELIGIBILITY_KEYWORDS = (
-    "ELIGIB", "QUALIF", "ENTITL", "VALID", "CRITERIA", "INCLUDE", "EXCLUDE",
-    "REJECT", "DISQUALIF", "APPROV", "DENY", "ACCEPT", "ACTIVE", "STATUS",
-    "IND", "FLAG",
+_DOT_TOKEN_RE = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b")
+_CONTROL_LOGIC_RE = re.compile(
+    r"\bIIF\s*\(|\bDECODE\s*\(|\bCASE\b|>=|<=|<>|!=|\bIN\s*\(|\bBETWEEN\b|=\s*'",
+    re.IGNORECASE,
 )
+_WHERE_RE = re.compile(r"\bWHERE\b", re.IGNORECASE)
 
-ELIGIBILITY_CATALOG_DISPLAY_COLS = [
+ELIGIBILITY_DISPLAY_COLS = [
     "Session",
     "Mapping/Mapplet",
     "Transformation Name",
     "Transformation Type",
     "Eligibility Rule/Logic (Technical)",
     "Eligibility Rule/Logic (Plain Language)",
-    "Source (Excel/XML)",
+    "Source (JSON/XML/XML)",
 ]
 
-ELIGIBILITY_SUMMARY_DISPLAY_COLS = [
+ELIGIBILITY_SUMMARY_COLS = [
     "Session",
     "Mapping/Mapplet",
     "Eligibility Rules/Logics",
 ]
 
 
-def _is_eligibility_row(ttype, port_name, business_logic):
-    if not business_logic or not business_logic.strip():
+def _text_has_keyword(text):
+    if not text:
         return False
-    t = (ttype or "").upper()
-    if any(g in t for g in ELIGIBILITY_GATING_TTYPES):
-        return True
-    if any(g in t for g in ELIGIBILITY_CONDITIONAL_TTYPES):
-        haystack = f"{port_name or ''} {business_logic or ''}".upper()
-        return any(kw in haystack for kw in ELIGIBILITY_KEYWORDS)
-    return False
+    t = text.lower()
+    return any(kw in t for kw in ELIGIBILITY_KEYWORDS)
 
 
-# Best-effort, rule-based technical -> plain-language rewrite. This is NOT
-# a semantic parser - it just expands common PowerCenter expression tokens
-# into words so a non-technical reader gets the gist. Anything it can't
-# confidently rewrite is left as-is; always keep the Technical column as
-# the source of truth.
-_PLAIN_LANG_REPLACEMENTS = [
-    (re.compile(r"\bIIF\s*\(", re.IGNORECASE), "IF ("),
-    (re.compile(r"\bISNULL\s*\(", re.IGNORECASE), "IS NULL("),
-    (re.compile(r"\bIS_SPACES\s*\(", re.IGNORECASE), "IS BLANK("),
-    (re.compile(r"!=\s*"), " is not equal to "),
-    (re.compile(r"<>\s*"), " is not equal to "),
-    (re.compile(r"\bAND\b", re.IGNORECASE), "AND"),
-    (re.compile(r"\bOR\b", re.IGNORECASE), "OR"),
-    (re.compile(r"\bNOT\b", re.IGNORECASE), "NOT"),
-    # Multi-char comparison operators MUST be replaced before the bare
-    # "=", ">", "<" patterns below, or e.g. ">=" gets its "=" consumed
-    # first and misreads as "greater than" + "equals" (two phrases
-    # instead of one "at least").
-    (re.compile(r">="), " is at least "),
-    (re.compile(r"<="), " is at most "),
-    (re.compile(r"=(?!=)"), " equals "),
-    (re.compile(r"(?<![<>=!])>(?!=)"), " is greater than "),
-    (re.compile(r"(?<![<>=!])<(?!=)"), " is less than "),
-]
+def _is_control_logic(text):
+    if not text:
+        return False
+    return bool(_CONTROL_LOGIC_RE.search(text))
 
 
-def plain_language_translate(expr):
-    """Rule-based translation of a technical condition/expression into a
-    rough plain-English rendering. Best-effort only - review before
-    treating as a business-approved definition."""
+def _looks_like_eligibility(label, text):
+    """Keyword + control-logic heuristic used for the transformation types
+    (Lookup, Expression/Aggregator, Transaction Control) whose logic is NOT
+    inherently eligibility-related, unlike Filter/Router/Update
+    Strategy/Source-Qualifier-filter, which are always reported when
+    present."""
+    if not text:
+        return False
+    combined = f"{label} {text}"
+    return _text_has_keyword(combined) and _is_control_logic(text)
+
+
+def _extract_sql_aliases(sql_text):
+    """Pull {ALIAS_UPPER: RealTableName} pairs out of FROM/JOIN clauses in
+    a raw SQL override / user-defined-join string. Best-effort regex based
+    - handles the common 'FROM TBL A' / 'FROM TBL AS A' / 'JOIN TBL B ON...'
+    shapes; anything more exotic (subqueries, multi-line CTEs) is left
+    unresolved rather than mis-parsed."""
+    alias_map = {}
+    if not sql_text:
+        return alias_map
+    for m in _TABLE_ALIAS_RE.finditer(sql_text):
+        tbl, alias = m.group(1), m.group(2)
+        if alias.upper() in _SQL_ALIAS_STOPWORDS or tbl.upper() in _SQL_ALIAS_STOPWORDS:
+            continue
+        if tbl.upper() == alias.upper():
+            continue
+        alias_map[alias.upper()] = tbl
+    return alias_map
+
+
+def _known_table_names(folder_idx):
+    cache = folder_idx.setdefault("_known_table_names_cache", None)
+    if cache is not None:
+        return cache
+    names = set()
+    for s in folder_idx.get("sources", {}).values():
+        names.add(str(s.get("table", "")).upper())
+    for t in folder_idx.get("targets", {}).values():
+        names.add(str(t.get("table", "")).upper())
+    for n in folder_idx.get("transformations", {}).keys():
+        names.add(str(n).upper())
+    folder_idx["_known_table_names_cache"] = names
+    return names
+
+
+def _annotate_aliases(text, alias_map, known_tables):
+    """Rewrite every 'ALIAS.COLUMN' occurrence in `text` as
+    'ALIAS (Actual: RealTable).COLUMN' per the alias-resolution
+    requirement. A dotted token whose left-hand side is already a known
+    real table/transformation name is left untouched (it isn't an alias).
+    A dotted token that isn't a known alias AND isn't a known real table is
+    flagged inline with '[alias unresolved]' rather than guessed at.
+    Returns (annotated_text, unresolved_found: bool)."""
+    if not text or not alias_map:
+        return text, False
+
+    unresolved = {"found": False}
+
+    def repl(m):
+        alias, col = m.group(1), m.group(2)
+        au = alias.upper()
+        if au in alias_map:
+            return f"{alias} (Actual: {alias_map[au]}).{col}"
+        if au in known_tables:
+            return m.group(0)
+        unresolved["found"] = True
+        return f"{alias} [alias unresolved].{col}"
+
+    annotated = _DOT_TOKEN_RE.sub(repl, text)
+    return annotated, unresolved["found"]
+
+
+def _for_plain_language(annotated_text):
+    """Strip 'ALIAS (Actual: RealTable).' down to just 'RealTable.' so the
+    plain-language column reads naturally using real table names, per the
+    requirement that plain language use resolved names too."""
+    if not annotated_text:
+        return annotated_text
+    return re.sub(r"[A-Za-z_]\w* \(Actual: ([A-Za-z_]\w*)\)\.", r"\1.", annotated_text)
+
+
+def _split_top_level_args(s):
+    """Split a comma-separated argument list at top level, respecting
+    nested parens and quoted string literals."""
+    args, depth, cur, in_str = [], 0, "", False
+    for ch in s:
+        if ch == "'":
+            in_str = not in_str
+            cur += ch
+            continue
+        if in_str:
+            cur += ch
+            continue
+        if ch == "(":
+            depth += 1
+            cur += ch
+            continue
+        if ch == ")":
+            depth -= 1
+            cur += ch
+            continue
+        if ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        args.append(cur.strip())
+    return args
+
+
+def _plain_condition(text):
+    """Token-level English gloss of comparison/logical operators in a
+    (non-IIF/DECODE-wrapped) condition string. Heuristic, not a full SQL
+    parser - good enough for a business-readable approximation."""
+    if not text:
+        return ""
+    t = text
+    replacements = [
+        (r">=", " is at least "),
+        (r"<=", " is at most "),
+        (r"<>", " is not equal to "),
+        (r"!=", " is not equal to "),
+        (r"\bNOT\s+IN\b", " is not one of "),
+        (r"\bIN\s*\(", " is one of ("),
+        (r"\bBETWEEN\b", " is between "),
+        (r"\bIS\s+NOT\s+NULL\b", " is not blank "),
+        (r"\bIS\s+NULL\b", " is blank "),
+        (r"\bISNULL\s*\(([^)]*)\)", r"\1 is blank"),
+        (r"\bAND\b", " AND "),
+        (r"\bOR\b", " OR "),
+        (r"\bNOT\b", " NOT "),
+    ]
+    for pat, rep in replacements:
+        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
+    # bare '=' (not part of >=, <=, <>, !=) reads as "equals"
+    t = re.sub(r"(?<![<>=!])=(?!=)", " equals ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _plain_language(expr):
+    """Best-effort business-readable translation of a technical
+    condition/expression. Recognizes a single top-level IIF(...)/
+    DECODE(...) wrapper and glosses the branches in plain English;
+    everything else (including the branch values of a recognized
+    wrapper) falls back to operator-level token translation. This is a
+    heuristic gloss, not a guaranteed-faithful natural-language
+    restatement - always cross-check against the Technical column."""
     if not expr:
         return ""
-    text = expr
-    for pattern, repl in _PLAIN_LANG_REPLACEMENTS:
-        text = pattern.sub(repl, text)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    return text
+    e = expr.strip()
+    m = re.match(r"^(IIF|DECODE)\s*\((.*)\)\s*$", e, re.IGNORECASE | re.DOTALL)
+    if m:
+        func, inner = m.group(1).upper(), m.group(2)
+        args = _split_top_level_args(inner)
+        if func == "IIF" and len(args) >= 2:
+            cond = _plain_condition(args[0])
+            true_val = args[1].strip()
+            false_val = args[2].strip() if len(args) > 2 else "no change / leave as-is"
+            return f"If {cond}, then result is {true_val}; otherwise {false_val}."
+        if func == "DECODE" and len(args) >= 2:
+            subject = args[0].strip()
+            pairs = args[1:]
+            parts = []
+            i = 0
+            default = None
+            while i < len(pairs) - 1:
+                parts.append(f"if {subject} equals {pairs[i].strip()} then result is {pairs[i+1].strip()}")
+                i += 2
+            if i < len(pairs):
+                default = pairs[i].strip()
+            text = "; ".join(parts)
+            text += f"; otherwise {default}." if default else "."
+            return text[0].upper() + text[1:] if text else text
+    plain = _plain_condition(e)
+    if plain and not plain.endswith("."):
+        plain += "."
+    return plain
 
 
-def find_mappings_using_mapplet(folder_idx, mapplet_def_name):
-    """Every mapping (by name) that drops in an INSTANCE of the given
-    mapplet definition. A mapplet can legitimately be called from several
-    mappings, so this returns a (possibly multi-item) sorted list."""
-    callers = set()
-    for mapping_name, mapping_node in folder_idx["mappings"].items():
-        for ch in mapping_node["children"]:
-            if ch["tag"] == "INSTANCE":
-                a = ch["attributes"]
-                if a.get("TRANSFORMATION_NAME") == mapplet_def_name and \
-                        mapplet_def_name in folder_idx.get("mapplets", {}):
-                    callers.add(mapping_name)
-                    break
-    return sorted(callers)
+def _mk_eligibility_row(name, ttype, technical_raw, folder_idx, alias_map=None,
+                         lineage_alias_keys=None):
+    """Build one Eligibility-Rules row dict (Transformation Name/Type +
+    Technical/Plain-Language/Source columns only - Session and
+    Mapping/Mapplet are stamped on by the caller, which knows the calling
+    context).
+
+    `lineage_alias_keys` names whichever entries in `alias_map` were only
+    resolvable by cross-referencing CONNECTOR/source-instance metadata
+    (as opposed to being spelled out directly in a FROM/JOIN clause of the
+    condition text itself) - used only to annotate the Source column with
+    "alias cross-verified via lineage" when that path was actually needed
+    for an alias that appears in this particular condition."""
+    known_tables = _known_table_names(folder_idx)
+    lineage_alias_keys = lineage_alias_keys or set()
+    if alias_map:
+        technical, had_unresolved = _annotate_aliases(technical_raw, alias_map, known_tables)
+    else:
+        technical, had_unresolved = technical_raw, False
+
+    used_lineage_alias = False
+    if lineage_alias_keys and technical_raw:
+        for k in lineage_alias_keys:
+            if re.search(r"\b" + re.escape(k) + r"\.", technical_raw, re.IGNORECASE):
+                used_lineage_alias = True
+                break
+
+    plain = _plain_language(_for_plain_language(technical))
+
+    source = "JSON (Table Attribute)"
+    if used_lineage_alias:
+        source += " - alias cross-verified via lineage"
+    if had_unresolved:
+        source += " - alias unresolved"
+
+    return {
+        "Transformation Name": name,
+        "Transformation Type": ttype,
+        "Eligibility Rule/Logic (Technical)": technical,
+        "Eligibility Rule/Logic (Plain Language)": plain,
+        "Source (JSON/XML/XML)": source,
+    }
 
 
-def build_eligibility_catalog(folder_idx, session_to_mapping, source_label="XML"):
-    """Folder-wide eligibility-rules catalog, per the 7-column spec.
+def _connected_source_tables(scope_idx, folder_idx, instance_name):
+    """Real table names feeding `instance_name` (typically a Source
+    Qualifier) via CONNECTOR edges whose FROMINSTANCETYPE is a Source
+    Definition, keyed by the connected source instance's own name (which,
+    for un-aliased SQL text, often stands in for the table name itself)."""
+    out = {}
+    for c in scope_idx.get("connectors", []):
+        if c.get("TOINSTANCE") != instance_name:
+            continue
+        if c.get("FROMINSTANCETYPE") != "Source Definition":
+            continue
+        src_inst = c.get("FROMINSTANCE")
+        tbl = folder_idx["sources"].get(src_inst, {}).get("table", src_inst)
+        if src_inst:
+            out[src_inst.upper()] = tbl
+    return out
 
-    session_to_mapping: {session_name: mapping_name} - used only to map a
-    mapping back to the session(s) that run it. Pass the FULL session map
-    (not just an anchor-restricted subset) if eligibility documentation
-    should cover the whole repository regardless of any single target's
-    lineage scope.
-    source_label: value written into "Source (Excel/XML)" for every row.
-    This pipeline only ever sees XML-derived JSON (no Excel detail-tab
-    pass), so every row is uniformly stamped "XML" unless a caller
-    supplies something else (e.g. after merging in Excel-tab findings).
+
+def _scan_transformation_for_eligibility(inst_name, ttype, tdef, scope_idx, folder_idx):
+    """Return a list of eligibility-row dicts (see _mk_eligibility_row) for
+    one transformation INSTANCE, based on its type. See module docstring
+    above for which types are always-reported vs. keyword-filtered."""
+    rows = []
+    t = (ttype or tdef.get("type") or "").upper()
+    ta = tdef.get("table_attrs", {})
+
+    if "FILTER" in t:
+        cond = _first_attr(ta, "Filter Condition")
+        if cond:
+            rows.append(_mk_eligibility_row(inst_name, "Filter", cond, folder_idx))
+
+    elif "ROUTER" in t:
+        for grp, gattrs in tdef.get("group_attrs", {}).items():
+            cond = _first_attr(gattrs, "Group Filter Condition", "Filter Condition", "Condition")
+            if cond:
+                rows.append(_mk_eligibility_row(
+                    f"{inst_name} [Group: {grp}]", "Router", cond, folder_idx))
+
+    elif "UPDATE STRATEGY" in t:
+        expr = _first_attr(ta, "Update Strategy Expression")
+        if expr:
+            rows.append(_mk_eligibility_row(inst_name, "Update Strategy", expr, folder_idx))
+
+    elif "SOURCE QUALIFIER" in t or t == "SQ":
+        sql = _first_attr(ta, "Sql Query", "Sql Override")
+        src_filter = _first_attr(ta, "Source Filter")
+        uj = _first_attr(ta, "User Defined Join")
+        include_sql = bool(sql) and bool(_WHERE_RE.search(sql))
+        if src_filter or include_sql or uj:
+            parts = []
+            if sql:
+                parts.append(f"SQL Override: {sql}")
+            if src_filter:
+                parts.append(f"Source Filter: {src_filter}")
+            if uj:
+                parts.append(f"User Defined Join: {uj}")
+            technical = "; ".join(parts)
+
+            text_alias_map = {}
+            text_alias_map.update(_extract_sql_aliases(sql or ""))
+            text_alias_map.update(_extract_sql_aliases(uj or ""))
+            lineage_alias_map = {}
+            for alias, tbl in _connected_source_tables(scope_idx, folder_idx, inst_name).items():
+                if alias != tbl.upper():
+                    lineage_alias_map[alias] = tbl
+            alias_map = {**lineage_alias_map, **text_alias_map}  # text-derived wins on conflict
+            lineage_alias_keys = set(lineage_alias_map) - set(text_alias_map)
+
+            rows.append(_mk_eligibility_row(
+                inst_name, "Source Qualifier", technical, folder_idx,
+                alias_map=alias_map, lineage_alias_keys=lineage_alias_keys))
+
+    elif "LOOKUP" in t:
+        cond = _first_attr(ta, "Lookup Condition")
+        sql = _first_attr(ta, "Lookup Sql Override", "Lookup Sql Overide")
+        lkp_table = _first_attr(ta, "Lookup table name", "Lookup Table Name") or inst_name
+        combo = " ".join(x for x in (cond, sql) if x)
+        if combo and _looks_like_eligibility(inst_name, combo):
+            parts = []
+            if cond:
+                parts.append(f"Lookup Condition: {cond}")
+            if sql:
+                parts.append(f"Lookup Sql Override: {sql}")
+            technical = "; ".join(parts)
+
+            text_alias_map = _extract_sql_aliases(sql or "")
+            lineage_alias_map = {}
+            if lkp_table.upper() != inst_name.upper():
+                lineage_alias_map[inst_name.upper()] = lkp_table
+            alias_map = {**lineage_alias_map, **text_alias_map}
+            lineage_alias_keys = set(lineage_alias_map) - set(text_alias_map)
+
+            rows.append(_mk_eligibility_row(
+                inst_name, "Lookup", technical, folder_idx,
+                alias_map=alias_map, lineage_alias_keys=lineage_alias_keys))
+
+    elif "TRANSACTION" in t:
+        cond = _first_attr(ta, "Transaction Control Condition")
+        if cond and _looks_like_eligibility(inst_name, cond):
+            rows.append(_mk_eligibility_row(inst_name, "Transaction Control", cond, folder_idx))
+
+    elif "EXPRESSION" in t or "AGGREGATOR" in t:
+        label = "Expression" if "EXPRESSION" in t else "Aggregator"
+        for port, expr in tdef.get("fields", {}).items():
+            if not expr:
+                continue
+            if _looks_like_eligibility(port, expr):
+                rows.append(_mk_eligibility_row(f"{inst_name}.{port}", label, expr, folder_idx))
+
+    return rows
+
+
+def build_eligibility_catalog(folder_idx, session_to_mapping):
+    """Folder-wide Eligibility Rules catalog (Tab-5). Scans every mapping's
+    own transformation instances, then every Mapplet that mapping
+    instantiates (mapplet-internal logic is captured once per mapping that
+    calls it, tagged 'MappingName -> MappletName', per the requirement).
+
+    `session_to_mapping` should be the UNRESTRICTED {session: mapping} map
+    across every workflow in the folder (not scoped down to any single
+    target's anchor execution-order window) - eligibility logic is a
+    property of the mapping/mapplet definitions themselves, not of any one
+    lineage query.
     """
-    mapping_sessions = defaultdict(list)
-    for sess, mp in (session_to_mapping or {}).items():
-        mapping_sessions[mp].append(sess)
-    for mp in mapping_sessions:
-        mapping_sessions[mp].sort()
-
-    def sessions_for(mapping_name):
-        sess = mapping_sessions.get(mapping_name, [])
-        return "; ".join(sess) if sess else "(no session found)"
+    mapping_to_sessions = defaultdict(list)
+    for s, mp in session_to_mapping.items():
+        mapping_to_sessions[mp].append(s)
 
     rows = []
 
-    # -- Mapping-level transformations (Filter/Router/Expression/Lookup/
-    #    Update Strategy/Source Qualifier living directly inside a mapping)
-    for r in build_transformation_catalog(folder_idx):
-        if not _is_eligibility_row(r["Transformation Type"], r["PORT_NAME"], r["Business Logic"]):
-            continue
-        mapping_name = r["_Mapping"]
-        rows.append({
-            "Session": sessions_for(mapping_name),
-            "Mapping/Mapplet": mapping_name,
-            "Transformation Name": r["Transformation Name"],
-            "Transformation Type": r["Transformation Type"],
-            "Eligibility Rule/Logic (Technical)": r["Business Logic"],
-            "Eligibility Rule/Logic (Plain Language)": plain_language_translate(r["Business Logic"]),
-            "Source (Excel/XML)": source_label,
-        })
+    # A given Mapplet definition is typically dropped into many different
+    # Mappings; index_mapping() on the mapplet's own node is independent of
+    # which caller reached it, so cache it once per mapplet name instead of
+    # re-indexing (and re-scanning) it from scratch for every mapping that
+    # happens to call it. On repos where a small set of shared mapplets are
+    # reused widely, this turns an O(mappings x mapplet_size) scan into
+    # O(mapplets x mapplet_size), which is where most of the wall-clock time
+    # for Tab-5/Tab-6 was going.
+    mapplet_scope_cache = {}
+    mapplet_rows_cache = {}
 
-    # -- Mapplet-internal transformations, attributed once per calling
-    #    mapping (a mapplet used by several mappings gets its logic
-    #    captured once per mapping that calls it, per spec).
-    for r in build_mapplet_transformation_catalog(folder_idx):
-        if not _is_eligibility_row(r["Transformation Type"], r["PORT_NAME"], r["Business Logic"]):
-            continue
-        mapplet_name = r["Mapplet Name"]
-        callers = find_mappings_using_mapplet(folder_idx, mapplet_name)
-        if not callers:
-            callers = ["(no calling mapping found)"]
-        for calling_mapping in callers:
-            label = f"{calling_mapping} -> {mapplet_name}" if calling_mapping != "(no calling mapping found)" \
-                else f"(unresolved) -> {mapplet_name}"
-            sess = sessions_for(calling_mapping) if calling_mapping != "(no calling mapping found)" \
-                else "(no session found)"
-            rows.append({
-                "Session": sess,
-                "Mapping/Mapplet": label,
-                "Transformation Name": r["Transformation Name"],
-                "Transformation Type": r["Transformation Type"],
-                "Eligibility Rule/Logic (Technical)": r["Business Logic"],
-                "Eligibility Rule/Logic (Plain Language)": plain_language_translate(r["Business Logic"]),
-                "Source (Excel/XML)": source_label,
-            })
+    def _mapplet_eligibility_rows(mapplet_def):
+        if mapplet_def not in mapplet_rows_cache:
+            mscope = index_mapping(folder_idx["mapplets"][mapplet_def])
+            mapplet_scope_cache[mapplet_def] = mscope
+            cached_rows = []
+            for minst_name, minst in mscope["instances"].items():
+                if minst["type"] != "TRANSFORMATION":
+                    continue
+                tdef = (mscope["local_transformations"].get(minst["transformation_name"])
+                        or folder_idx["transformations"].get(minst["transformation_name"]))
+                if not tdef:
+                    continue
+                ttype = minst.get("transformation_type") or tdef.get("type") or ""
+                for r in _scan_transformation_for_eligibility(minst_name, ttype, tdef, mscope, folder_idx):
+                    cached_rows.append(r)
+            mapplet_rows_cache[mapplet_def] = cached_rows
+        return mapplet_rows_cache[mapplet_def]
 
-    # De-duplicate exact repeats, then sort for stable, readable output.
+    for mapping_name, mapping_node in folder_idx["mappings"].items():
+        m = index_mapping(mapping_node)
+        sessions = ", ".join(sorted(set(mapping_to_sessions.get(mapping_name, []))))
+
+        for inst_name, inst in m["instances"].items():
+            if inst["type"] != "TRANSFORMATION":
+                continue
+            tdef = (m["local_transformations"].get(inst["transformation_name"])
+                    or folder_idx["transformations"].get(inst["transformation_name"]))
+            if not tdef:
+                continue
+            ttype = inst.get("transformation_type") or tdef.get("type") or ""
+            for r in _scan_transformation_for_eligibility(inst_name, ttype, tdef, m, folder_idx):
+                r["Session"] = sessions
+                r["Mapping/Mapplet"] = mapping_name
+                rows.append(r)
+
+        processed_mapplets = set()
+        for inst_name, inst in m["instances"].items():
+            mapplet_def = inst.get("transformation_name")
+            if mapplet_def not in folder_idx.get("mapplets", {}):
+                continue
+            if mapplet_def in processed_mapplets:
+                continue
+            processed_mapplets.add(mapplet_def)
+
+            for cached_row in _mapplet_eligibility_rows(mapplet_def):
+                r = dict(cached_row)
+                r["Session"] = sessions
+                r["Mapping/Mapplet"] = f"{mapping_name} \u2192 {mapplet_def}"
+                rows.append(r)
+
     seen = set()
     deduped = []
     for r in rows:
-        key = tuple(r[c] for c in ELIGIBILITY_CATALOG_DISPLAY_COLS)
+        key = tuple(r[c] for c in ELIGIBILITY_DISPLAY_COLS)
         if key in seen:
             continue
         seen.add(key)
         deduped.append(r)
 
-    return sorted(deduped, key=lambda r: (r["Session"], r["Mapping/Mapplet"], r["Transformation Name"]))
+    return sorted(deduped, key=lambda r: (r["Mapping/Mapplet"], r["Transformation Name"]))
 
 
 def build_eligibility_summary(eligibility_rows):
-    """Collapses the full Eligibility Rules catalog into the optional
-    3-column "Eligibility Rules - Summary" view: one row per
-    (Session, Mapping/Mapplet), with every rule found for that combination
-    concatenated as a bullet list in the last column."""
-    grouped = defaultdict(list)
+    """Tab-6 'Eligibility Rules - Summary': one row per (Session,
+    Mapping/Mapplet), concatenating every rule found for that combination
+    as a bullet list within the 'Eligibility Rules/Logics' cell."""
+    grouped = {}
     order = []
     for r in eligibility_rows:
         key = (r["Session"], r["Mapping/Mapplet"])
         if key not in grouped:
+            grouped[key] = []
             order.append(key)
-        bullet = f"- [{r['Transformation Type']}] {r['Transformation Name']}: {r['Eligibility Rule/Logic (Technical)']}"
+        bullet = (f"\u2022 [{r['Transformation Name']} ({r['Transformation Type']})] "
+                  f"{r['Eligibility Rule/Logic (Plain Language)']}")
         grouped[key].append(bullet)
 
     return [
         {
-            "Session": sess,
-            "Mapping/Mapplet": mp,
-            "Eligibility Rules/Logics": "\n".join(grouped[(sess, mp)]),
+            "Session": session,
+            "Mapping/Mapplet": mapping,
+            "Eligibility Rules/Logics": "\n".join(grouped[(session, mapping)]),
         }
-        for sess, mp in order
+        for session, mapping in order
     ]

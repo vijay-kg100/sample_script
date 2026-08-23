@@ -14,8 +14,8 @@ from lineage_engine import (
     CATALOG_DISPLAY_COLS,
     build_mapplet_catalog, MAPPLET_CATALOG_DISPLAY_COLS,
     build_mapplet_transformation_catalog, MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS,
-    build_eligibility_catalog, ELIGIBILITY_CATALOG_DISPLAY_COLS,
-    build_eligibility_summary, ELIGIBILITY_SUMMARY_DISPLAY_COLS,
+    build_eligibility_catalog, ELIGIBILITY_DISPLAY_COLS,
+    build_eligibility_summary, ELIGIBILITY_SUMMARY_COLS,
 )
 
 
@@ -103,10 +103,7 @@ _HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <header>
   <h1>$title</h1>
   <p>Tab 1: field-level lineage. Tab 2: transformation catalog. Tab 3: mapplet boundary-to-boundary
-     field paths. Tab 4: transformations living inside each mapplet. Eligibility Rules: every
-     Filter/Router/Expression/Lookup/Update Strategy/Source Qualifier (incl. mapplet-internal)
-     rule that looks like eligibility/qualification logic, repository-wide. Eligibility Rules -
-     Summary: the same rules grouped one row per Session/Mapping. Click any hop in a
+     field paths. Tab 4: transformations living inside each mapplet. Click any hop in a
      Transformation Lineage chain to jump to its row in the catalog (or, for a "[Mapplet]" hop, to
      its paths in Tab 3). Click any hop inside a Tab 3 row's Transformation_lineage to jump to
      Tab 4 (mapplet-internal hops) or back to Tab 2 (hops outside the mapplet boundary).</p>
@@ -573,11 +570,8 @@ function mappletTransformsPage(delta){
 }
 
 function renderEligibility(){
-  // Eligibility Rules tab is always emitted (mirrors Tab-1/Tab-2), even
-  // when 0 rows matched, so this element should always exist - guard kept
-  // anyway for safety/consistency with the other render*() functions.
   const searchEl = document.getElementById('eligibility-search');
-  if(!searchEl) return;
+  if(!searchEl) return; // no Eligibility Rules tab in this report
   const q = searchEl.value;
   let filtered = eligibilityRows.filter(r => rowMatchesColumnFilters('eligibility', r));
   filtered = filterRows(filtered, ELIGIBILITY_COLS, q);
@@ -588,11 +582,10 @@ function renderEligibility(){
   if(eligibilityPageNum < 0) eligibilityPageNum = 0;
   const start = eligibilityPageNum * PAGE_SIZE;
   const pageRows = filtered.slice(start, start + PAGE_SIZE);
+  const wrapCols = new Set(['Eligibility Rule/Logic (Technical)', 'Eligibility Rule/Logic (Plain Language)']);
   document.getElementById('eligibility-body').innerHTML = pageRows.map(r => {
     return '<tr>' + ELIGIBILITY_COLS.map(c => {
-      if(c === 'Eligibility Rule/Logic (Technical)' || c === 'Eligibility Rule/Logic (Plain Language)'){
-        return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
-      }
+      if(wrapCols.has(c)) return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
       return '<td>' + escapeHtml(r[c] ?? '') + '</td>';
     }).join('') + '</tr>';
   }).join('');
@@ -606,11 +599,8 @@ function eligibilityPage(delta){
 }
 
 function renderEligibilitySummary(){
-  // Eligibility Rules - Summary tab only exists in the DOM when there is
-  // at least one eligibility row to summarize - no-op otherwise so
-  // init/search calls never throw on a missing element.
   const searchEl = document.getElementById('eligibility-summary-search');
-  if(!searchEl) return;
+  if(!searchEl) return; // no Eligibility Rules - Summary tab in this report
   const q = searchEl.value;
   let filtered = eligibilitySummaryRows.filter(r => rowMatchesColumnFilters('eligibility_summary', r));
   filtered = filterRows(filtered, ELIGIBILITY_SUMMARY_COLS, q);
@@ -624,9 +614,7 @@ function renderEligibilitySummary(){
   const pageRows = filtered.slice(start, start + PAGE_SIZE);
   document.getElementById('eligibility-summary-body').innerHTML = pageRows.map(r => {
     return '<tr>' + ELIGIBILITY_SUMMARY_COLS.map(c => {
-      if(c === 'Eligibility Rules/Logics'){
-        return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
-      }
+      if(c === 'Eligibility Rules/Logics') return '<td class="logic-cell">' + escapeHtml(r[c] ?? '') + '</td>';
       return '<td>' + escapeHtml(r[c] ?? '') + '</td>';
     }).join('') + '</tr>';
   }).join('');
@@ -921,13 +909,13 @@ _ELIGIBILITY_SUMMARY_PANEL_TMPL = """<div id="eligibility_summary" class="panel"
 
 def write_html_report(df_lineage, df_catalog, df_mapplet, df_mapplet_transform, out_path,
                        title="Lineage Report", has_mapplets=False, has_mapplet_transforms=False,
-                       df_eligibility=None, df_eligibility_summary=None,
-                       has_eligibility_summary=False):
+                       df_eligibility=None, df_eligibility_summary=None, has_eligibility=False):
     # Tab-3 (Mapplets) / Tab-4 (Mapplet_Transformations) markup is only
     # emitted at all when the repository actually contains the relevant data
     # (improvement-5). When absent, the placeholders resolve to "" so no tab
     # button, no panel, and (via each render*()'s own element-existence
-    # guard) no JS error at init time either.
+    # guard) no JS error at init time either. Tab-5/Tab-6 (Eligibility
+    # Rules / Eligibility Rules - Summary) follow the same convention.
     mapplets_tab_button = (
         _MAPPLETS_TAB_BUTTON_TMPL.format(n=len(df_mapplet)) if has_mapplets else ""
     )
@@ -938,22 +926,20 @@ def write_html_report(df_lineage, df_catalog, df_mapplet, df_mapplet_transform, 
     )
     mapplet_transforms_panel = _MAPPLET_TRANSFORMS_PANEL_TMPL if has_mapplet_transforms else ""
 
-    # Eligibility Rules tab is always emitted, even when 0 rows matched -
-    # mirrors the Excel export convention (an always-present, predictably
-    # named/positioned sheet signals "nothing matched" rather than "tab is
-    # missing"). The Summary tab, like Mapplets/Mapplet_Transformations,
-    # is only emitted when there's actually something to summarize.
     if df_eligibility is None:
-        df_eligibility = pd.DataFrame(columns=ELIGIBILITY_CATALOG_DISPLAY_COLS)
+        df_eligibility = pd.DataFrame(columns=ELIGIBILITY_DISPLAY_COLS)
     if df_eligibility_summary is None:
-        df_eligibility_summary = pd.DataFrame(columns=ELIGIBILITY_SUMMARY_DISPLAY_COLS)
-    eligibility_tab_button = _ELIGIBILITY_TAB_BUTTON_TMPL.format(n=len(df_eligibility))
-    eligibility_panel = _ELIGIBILITY_PANEL_TMPL
+        df_eligibility_summary = pd.DataFrame(columns=ELIGIBILITY_SUMMARY_COLS)
+
+    eligibility_tab_button = (
+        _ELIGIBILITY_TAB_BUTTON_TMPL.format(n=len(df_eligibility)) if has_eligibility else ""
+    )
+    eligibility_panel = _ELIGIBILITY_PANEL_TMPL if has_eligibility else ""
     eligibility_summary_tab_button = (
         _ELIGIBILITY_SUMMARY_TAB_BUTTON_TMPL.format(n=len(df_eligibility_summary))
-        if has_eligibility_summary else ""
+        if has_eligibility else ""
     )
-    eligibility_summary_panel = _ELIGIBILITY_SUMMARY_PANEL_TMPL if has_eligibility_summary else ""
+    eligibility_summary_panel = _ELIGIBILITY_SUMMARY_PANEL_TMPL if has_eligibility else ""
 
     cat = df_catalog.copy()
     # Composite key unique to Transformation Name + Mapping + Port, so that
@@ -1010,14 +996,15 @@ def write_html_report(df_lineage, df_catalog, df_mapplet, df_mapplet_transform, 
         catalog_cols=json.dumps(CATALOG_DISPLAY_COLS),
         mapplet_cols=json.dumps(MAPPLET_CATALOG_DISPLAY_COLS),
         mapplet_transform_cols=json.dumps(MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS),
-        eligibility_cols=json.dumps(ELIGIBILITY_CATALOG_DISPLAY_COLS),
-        eligibility_summary_cols=json.dumps(ELIGIBILITY_SUMMARY_DISPLAY_COLS),
+        eligibility_cols=json.dumps(ELIGIBILITY_DISPLAY_COLS),
+        eligibility_summary_cols=json.dumps(ELIGIBILITY_SUMMARY_COLS),
         lineage_rows=json.dumps(df_lineage.to_dict(orient="records")),
         catalog_rows=json.dumps(cat.to_dict(orient="records")),
         mapplet_rows=json.dumps(mpl.to_dict(orient="records")),
         mapplet_transform_rows=json.dumps(mpt.to_dict(orient="records")),
-        eligibility_rows=json.dumps(df_eligibility.to_dict(orient="records")),
-        eligibility_summary_rows=json.dumps(df_eligibility_summary.to_dict(orient="records")),
+        eligibility_rows=json.dumps(df_eligibility[ELIGIBILITY_DISPLAY_COLS].to_dict(orient="records")),
+        eligibility_summary_rows=json.dumps(
+            df_eligibility_summary[ELIGIBILITY_SUMMARY_COLS].to_dict(orient="records")),
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -1428,21 +1415,20 @@ def build_lineage(json_path, target_table, target_instance_name, target_mapping_
     df_mapplet_transform_display = df_mapplet_transform[MAPPLET_TRANSFORM_CATALOG_DISPLAY_COLS]
     has_mapplet_transforms = len(df_mapplet_transform) > 0
 
-    # Eligibility Rules tab: scans the full-catalog Filter/Router/
-    # Expression/Lookup/Update Strategy/Source Qualifier (+ mapplet-
-    # internal) logic already extracted above and pulls out whatever
-    # looks like eligibility/qualification logic. Uses the FULL
-    # session-to-mapping map (every session across the workflow(s) in
-    # scope), not just the anchor-restricted `in_scope` subset, so this
-    # tab documents eligibility rules repository-wide rather than only
-    # upstream of the one target this run happens to be tracing.
-    eligibility_rows = build_eligibility_catalog(folder_idx, session_to_mapping)
-    df_eligibility = pd.DataFrame(eligibility_rows, columns=ELIGIBILITY_CATALOG_DISPLAY_COLS)
+    # Tab-5 / Tab-6: Eligibility Rules and Eligibility Rules - Summary.
+    # Scans every Filter/Router/Expression/Lookup/Update Strategy/Source
+    # Qualifier (and Transaction Control/Aggregator) transformation across
+    # every mapping AND every mapplet it calls, folder-wide - this is a
+    # property of the mapping/mapplet definitions themselves, so it is
+    # NOT restricted to the anchor target's execution-order window the way
+    # Tab-1 is; it uses the full (unrestricted) session_to_mapping map
+    # built above from every workflow in scope for this run.
+    eligibility_rows_raw = build_eligibility_catalog(folder_idx, session_to_mapping)
+    df_eligibility = pd.DataFrame(eligibility_rows_raw, columns=ELIGIBILITY_DISPLAY_COLS)
     has_eligibility = len(df_eligibility) > 0
 
-    eligibility_summary_rows = build_eligibility_summary(eligibility_rows)
-    df_eligibility_summary = pd.DataFrame(eligibility_summary_rows, columns=ELIGIBILITY_SUMMARY_DISPLAY_COLS)
-    has_eligibility_summary = len(df_eligibility_summary) > 0
+    eligibility_summary_rows = build_eligibility_summary(eligibility_rows_raw)
+    df_eligibility_summary = pd.DataFrame(eligibility_summary_rows, columns=ELIGIBILITY_SUMMARY_COLS)
 
     if out_dir:
         resolved_out_dir = out_dir
@@ -1469,12 +1455,8 @@ def build_lineage(json_path, target_table, target_instance_name, target_mapping_
                 df_mapplet_display.to_excel(writer, sheet_name="Mapplets", index=False)
             if has_mapplet_transforms:
                 df_mapplet_transform_display.to_excel(writer, sheet_name="Mapplet_Transformations", index=False)
-            # Always write the "Eligibility Rules" tab, even when empty,
-            # so it's always present at a predictable name/position for
-            # downstream consumption - an empty sheet with just headers
-            # signals "nothing matched" rather than "tab is missing".
-            df_eligibility.to_excel(writer, sheet_name="Eligibility Rules", index=False)
-            if has_eligibility_summary:
+            if has_eligibility:
+                df_eligibility.to_excel(writer, sheet_name="Eligibility Rules", index=False)
                 df_eligibility_summary.to_excel(writer, sheet_name="Eligibility Rules - Summary", index=False)
     except Exception as e:
         print("xlsx export skipped:", e)
@@ -1487,7 +1469,7 @@ def build_lineage(json_path, target_table, target_instance_name, target_mapping_
                            has_mapplet_transforms=has_mapplet_transforms,
                            df_eligibility=df_eligibility,
                            df_eligibility_summary=df_eligibility_summary,
-                           has_eligibility_summary=has_eligibility_summary)
+                           has_eligibility=has_eligibility)
         html_written = True
     except Exception as e:
         print("html export skipped:", e)
@@ -1496,14 +1478,13 @@ def build_lineage(json_path, target_table, target_instance_name, target_mapping_
     print(f"Transformations catalogued (Port-level, deduplicated): {len(df_catalog)}")
     print(f"Mapplet field paths catalogued (deduplicated): {len(df_mapplet)}")
     print(f"Mapplet-internal transformations catalogued (deduplicated): {len(df_mapplet_transform)}")
-    print(f"Eligibility rules found (Filter/Router/Expression/Lookup/Update Strategy/"
-          f"Source Qualifier/Mapplet-internal): {len(df_eligibility)}")
+    print(f"Eligibility rules identified: {len(df_eligibility)}")
     print(f"Sessions in scope (1..{anchor_order}): {len(in_scope)}")
     print(f"Wrote: {csv_path}")
     print(f"Wrote: {xlsx_path}")
     if html_written:
         print(f"Wrote: {html_path}")
-    return df_out, df_catalog, df_mapplet, df_mapplet_transform, df_eligibility
+    return df_out, df_catalog, df_mapplet, df_mapplet_transform, df_eligibility, df_eligibility_summary
 
 
 if __name__ == "__main__":
