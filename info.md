@@ -30,3 +30,15 @@ There's also a GPO called "Do not preserve zone information in file attachments"
 One caveat either way
 
 Even if you suppress MOTW via zone mapping, the file is still not actually a legacy .xls — it's a zip/xlsx renamed. Some Office builds also apply "extension hardening" checks independent of MOTW under certain security configurations, so the warning could resurface later with an Office update or a stricter org policy, regardless of zone settings. The zone-mapping fix is legitimate and low-effort, but it's masking the mismatch rather than removing it — the POI conversion I gave you removes the mismatch at the source, so it stays fixed no matter what Windows/Office does with zones in the future. If you can get IT to add the site-to-zone entry, I'd do both: it's a nice belt-and-suspenders combo, but I wouldn't rely on zone mapping alone as your only fix.
+
+
+
+=====================================================================
+JAR runs on a Linux/Unix prod server, and no Windows is involved anywhere in that server-side execution — the JVM, the file I/O, the HTTPS call to BO, the byte conversion, all of it happens entirely within Linux, with zero Windows OS involvement on the server side.
+
+Where Windows does enter the picture is one hop later, and outside your server entirely: whoever downloads the exported file — an end user opening it in a browser on their Windows desktop. That's the only place MOTW exists, because MOTW is a Windows NTFS/Explorer/Office feature, not a server-side or protocol-side thing. Your Linux prod server has no NTFS, no Zone.Identifier concept, no Attachment Execution Service — none of the machinery that creates MOTW even exists there.
+
+So to state it plainly:
+
+Your Linux prod server: never touches MOTW, can't create it, can't suppress it — it's simply not a concept that applies to Linux at all.
+The end user's Windows machine: this is where MOTW gets attached (when their browser saves the file) and where the "format doesn't match extension" warning fires (when their Excel opens it).
